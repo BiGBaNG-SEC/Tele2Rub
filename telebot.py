@@ -588,6 +588,7 @@ async def media_handler(client: Client, message: Message):
         await message.reply_text("فایل قابل پردازش نیست.")
         return
 
+    # Build a suggested filename but we'll use the actual downloaded path
     download_name = build_download_filename(message, media_type, media)
     download_path = DOWNLOAD_DIR / download_name
 
@@ -610,20 +611,23 @@ async def media_handler(client: Client, message: Message):
         if not downloaded:
             raise RuntimeError("Download failed.")
 
+        # Use the ACTUAL path returned by pyrogram (it may differ from what we requested)
         downloaded_path = Path(downloaded)
         if not downloaded_path.exists():
             raise RuntimeError("Downloaded file not found.")
 
+        # Use actual filename from disk, not the predicted one
+        actual_name = downloaded_path.name
         file_size = downloaded_path.stat().st_size
         settings = load_settings()
 
         task = {
             "type": "local_file",
-            "path": str(downloaded_path),
+            "path": str(downloaded_path),   # real path on disk
             "caption": message.caption or "",
             "chat_id": message.chat.id,
             "status_message_id": status.id,
-            "file_name": download_name,
+            "file_name": actual_name,        # real filename
             "file_size": file_size,
             "safe_mode": settings.get("safe_mode", False),
             "zip_password": settings.get("zip_password", ""),
