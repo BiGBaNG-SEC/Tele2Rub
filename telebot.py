@@ -6,7 +6,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 import asyncio
 import time
 from urllib.parse import urlparse
@@ -26,6 +26,7 @@ STATUS_FILE = QUEUE_DIR / "status.jsonl"
 SETTINGS_FILE = QUEUE_DIR / "settings.json"
 DELETED_FILE = QUEUE_DIR / "deleted.jsonl"
 CANCEL_FILE = QUEUE_DIR / "cancelled.jsonl"
+RESET_FILE = QUEUE_DIR / "reset.flag"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,6 +99,33 @@ def build_download_filename(message: Message, media_type: str, media) -> str:
     return safe_filename(unique_name)
 
 waiting_for_zip_password = False
+
+
+# ─────────────────────────── keyboard helpers ────────────────────────────
+
+def cancel_button(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ لغو", callback_data=f"cancel:{job_id}")
+    ]])
+
+
+def settings_keyboard(safe_mode: bool) -> InlineKeyboardMarkup:
+    toggle_label = "🛡 Safe Mode: روشن ✅" if safe_mode else "🛡 Safe Mode: خاموش ❌"
+    toggle_cb = "safemode:off" if safe_mode else "safemode:on"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_label, callback_data=toggle_cb)],
+        [InlineKeyboardButton("🔑 تغییر رمز ZIP", callback_data="safemode:setpass")],
+        [InlineKeyboardButton("🗑 پاک کردن کل صف", callback_data="delall:confirm")],
+    ])
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚙️ تنظیمات", callback_data="menu:settings"),
+            InlineKeyboardButton("📋 وضعیت صف", callback_data="menu:queue"),
+        ]
+    ])
 
 class QueueManager:
     def __init__(self):
@@ -289,7 +317,10 @@ async def status_watcher():
                 if percent is not None:
                     text += f"\n\n`{progress_bar(float(percent))}` `{float(percent):.1f}%`"
                 try:
-                    await app.edit_message_text(chat_id, msg_id, text)
+                    status_val = data.get("status", "")
+                    job_id = data.get("job_id")
+                    markup = cancel_button(job_id) if job_id and status_val in ("uploading", "downloading", "processing", "working") else None
+                    await app.edit_message_text(chat_id, msg_id, text, reply_markup=markup)
                 except Exception:
                     pass
         except Exception:
@@ -306,17 +337,14 @@ async def start_handler(client: Client, message: Message):
         "بعد فایل رو اینجا بفرست تا توی روبیکا برات ارسال کنم.\n\n"
         "📌 راهنمای ربات:\n\n"
         "-حذف از صف:\n"
-        "هر فایل وقتی تو صف قرار می‌گیره یه دستور لغو داره که با اون دستور می‌تونی حذفش کنی.\n"
+        "هر فایل وقتی تو صف قرار می‌گیره دکمه ❌ لغو داره.\n"
         "⚠️اگر فایل در حال آپلود باشه، لغو بعد از پایان تلاش فعلی انجام میشه.\n\n"
-        "-پاکسازی کل صف:\n"
-        "/delall\n\n"
+        "-پاکسازی کل صف: دکمه 🗑 در تنظیمات\n\n"
         "-حالت Safe Mode:\n"
         "همه فایل‌ها با رمز دلخواهت به صورت ZIP رمزدار ارسال میشن.\n\n"
-        "برای فعال/غیرفعال کردن:\n"
-        " /safemode on\n"
-        " /safemode off\n\n"
         "⚠️برای فایل‌های حجیم و ویدیوها بهتره Safe Mode خاموش باشه تا سریع‌تر آپلود بشن.\n\n"
-        "@caffeinexz"
+        "@caffeinexz",
+        reply_markup=start_keyboard()
     )
 
 @app.on_message(filters.private & filters.command("safemode"))
@@ -359,23 +387,37 @@ async def safemode_handler(client: Client, message: Message):
     await message.reply_text("دستور نامعتبر است. از `/safemode on` یا `/safemode off` استفاده کن.")
 
 
+
 @app.on_message(filters.private & filters.command("delall"))
 async def clear_queue_handler(client: Client, message: Message):
     tasks = queue.all()
 
-    if not tasks:
+    # Also grab the currently-processing task (if any) so we can notify it
+    processing_task = None
+    try:
+        proc_file = QUEUE_DIR / "processing.json"
+        if proc_file.exists():
+            processing_task = json.loads(proc_file.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    all_tasks = list(tasks)
+    if processing_task:
+        all_tasks.insert(0, processing_task)
+
+    if not all_tasks:
         await message.reply_text("صف خالی است.")
         return
 
-    for task in tasks:
+    for task in all_tasks:
         mark_deleted(task)
 
         old_path = task.get("path")
         if old_path:
             try:
-                path = Path(old_path)
-                if path.exists():
-                    path.unlink()
+                p = Path(old_path)
+                if p.exists():
+                    p.unlink()
             except Exception:
                 pass
 
@@ -392,6 +434,10 @@ async def clear_queue_handler(client: Client, message: Message):
         pass
     queue._cache = None
     queue._mtime = 0
+
+    # Signal rub.py worker to stop the active upload and reset cleanly
+    RESET_FILE.touch()
+
     await message.reply_text("تمام موارد در صف پاک شد.")
 
 @app.on_message(filters.private & filters.command("del"))
@@ -518,9 +564,8 @@ async def text_handler(client: Client, message: Message):
 
     await status.edit_text(
         f"لینک در صف قرار گرفت.\n\n"
-        f"شناسه: `{task['job_id']}`\n"
-        f"برای حذف این مورد از صف:\n"
-        f"`/del {task['job_id']}`"
+        f"شناسه: `{task['job_id']}`",
+        reply_markup=cancel_button(task['job_id'])
     )
 
     
@@ -590,13 +635,231 @@ async def media_handler(client: Client, message: Message):
             f"در صف قرار گرفت.\n\n"
             f"فایل: `{download_name}`\n"
             f"حجم: `{pretty_size(file_size)}`\n"
-            f"شناسه: `{task['job_id']}`\n\n"
-            f"برای حذف این مورد از صف:\n"
-            f"`/del {task['job_id']}`"
+            f"شناسه: `{task['job_id']}`",
+            reply_markup=cancel_button(task['job_id'])
         )
 
     except Exception as e:
         await status.edit_text(f"خطا: {str(e)}")
+
+# ─────────────────────────── queue status helper ────────────────────────────
+
+def queue_status_text() -> str:
+    tasks = queue.all()
+    processing_task = None
+    try:
+        proc_file = QUEUE_DIR / "processing.json"
+        if proc_file.exists():
+            processing_task = json.loads(proc_file.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    lines = ["📋 وضعیت صف\n"]
+
+    if processing_task:
+        name = processing_task.get("file_name") or processing_task.get("url", "")[:40]
+        lines.append(f"⚙️ در حال پردازش: `{name}`")
+
+    count = len(tasks)
+    if count == 0 and not processing_task:
+        lines.append("صف خالی است.")
+    elif count > 0:
+        lines.append(f"\n{count} فایل در صف منتظر:")
+        for i, t in enumerate(tasks[:5], 1):
+            name = t.get("file_name") or t.get("url", "")[:40]
+            lines.append(f"  {i}. `{name}`")
+        if count > 5:
+            lines.append(f"  ... و {count - 5} مورد دیگر")
+
+    return "\n".join(lines)
+
+
+# ─────────────────────────── callback query handlers ────────────────────────────
+
+@app.on_callback_query(filters.regex(r"^cancel:(.+)$"))
+async def cb_cancel(client: Client, query: CallbackQuery):
+    job_id = query.data.split(":", 1)[1]
+
+    # Try to remove from queue first (not yet processing)
+    removed = queue.remove(job_id=job_id)
+
+    if removed:
+        mark_deleted(removed)
+        old_path = removed.get("path")
+        if old_path:
+            try:
+                p = Path(old_path)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        try:
+            await query.message.edit_text("❌ از صف حذف شد.", reply_markup=None)
+        except Exception:
+            pass
+        await query.answer("از صف حذف شد.")
+        return
+
+    # Already processing — register cancel signal
+    if was_deleted(job_id=job_id):
+        await query.answer("قبلاً حذف شده.")
+        return
+
+    cancel_job(job_id)
+    try:
+        await query.message.edit_text(
+            query.message.text + "\n\n⏳ درخواست لغو ثبت شد...",
+            reply_markup=None
+        )
+    except Exception:
+        pass
+    await query.answer("درخواست لغو ثبت شد.")
+
+
+@app.on_callback_query(filters.regex(r"^menu:settings$"))
+async def cb_settings(client: Client, query: CallbackQuery):
+    settings = load_settings()
+    safe_mode = settings.get("safe_mode", False)
+    status_text = "روشن ✅" if safe_mode else "خاموش ❌"
+    pass_text = f"\nرمز فعلی: `{settings['zip_password']}`" if safe_mode and settings.get("zip_password") else ""
+    await query.message.edit_text(
+        f"⚙️ تنظیمات\n\n"
+        f"Safe Mode: {status_text}{pass_text}",
+        reply_markup=settings_keyboard(safe_mode)
+    )
+    await query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^menu:queue$"))
+async def cb_queue(client: Client, query: CallbackQuery):
+    text = queue_status_text()
+    await query.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔄 بروزرسانی", callback_data="menu:queue"),
+            InlineKeyboardButton("🔙 بازگشت", callback_data="menu:back"),
+        ]])
+    )
+    await query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^menu:back$"))
+async def cb_back(client: Client, query: CallbackQuery):
+    await query.message.edit_text(
+        "منوی اصلی:",
+        reply_markup=start_keyboard()
+    )
+    await query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^safemode:on$"))
+async def cb_safemode_on(client: Client, query: CallbackQuery):
+    global waiting_for_zip_password
+    settings = load_settings()
+    settings["safe_mode"] = True
+    save_settings(settings)
+    waiting_for_zip_password = True
+    await query.message.edit_text(
+        "🛡 Safe Mode فعال شد.\n\n"
+        "لطفاً رمز ZIP مورد نظرت رو بفرست:",
+        reply_markup=None
+    )
+    await query.answer("Safe Mode فعال شد.")
+
+
+@app.on_callback_query(filters.regex(r"^safemode:off$"))
+async def cb_safemode_off(client: Client, query: CallbackQuery):
+    global waiting_for_zip_password
+    settings = load_settings()
+    settings["safe_mode"] = False
+    settings["zip_password"] = ""
+    save_settings(settings)
+    waiting_for_zip_password = False
+    await query.message.edit_text(
+        "⚙️ تنظیمات\n\nSafe Mode: خاموش ❌",
+        reply_markup=settings_keyboard(False)
+    )
+    await query.answer("Safe Mode خاموش شد.")
+
+
+@app.on_callback_query(filters.regex(r"^safemode:setpass$"))
+async def cb_safemode_setpass(client: Client, query: CallbackQuery):
+    global waiting_for_zip_password
+    settings = load_settings()
+    settings["safe_mode"] = True
+    save_settings(settings)
+    waiting_for_zip_password = True
+    await query.message.edit_text(
+        "🔑 رمز جدید ZIP رو بفرست:",
+        reply_markup=None
+    )
+    await query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^delall:confirm$"))
+async def cb_delall_confirm(client: Client, query: CallbackQuery):
+    await query.message.edit_text(
+        "⚠️ مطمئنی میخوای کل صف رو پاک کنی؟",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ بله، پاک کن", callback_data="delall:do"),
+                InlineKeyboardButton("❌ نه", callback_data="menu:settings"),
+            ]
+        ])
+    )
+    await query.answer()
+
+
+@app.on_callback_query(filters.regex(r"^delall:do$"))
+async def cb_delall_do(client: Client, query: CallbackQuery):
+    await query.answer("در حال پاکسازی...")
+
+    tasks = queue.all()
+    processing_task = None
+    try:
+        proc_file = QUEUE_DIR / "processing.json"
+        if proc_file.exists():
+            processing_task = json.loads(proc_file.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    all_tasks = list(tasks)
+    if processing_task:
+        all_tasks.insert(0, processing_task)
+
+    for task in all_tasks:
+        mark_deleted(task)
+        old_path = task.get("path")
+        if old_path:
+            try:
+                p = Path(old_path)
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        try:
+            await client.edit_message_text(
+                chat_id=task["chat_id"],
+                message_id=task["status_message_id"],
+                text="❌ این مورد از صف حذف شد.",
+                reply_markup=None
+            )
+        except Exception:
+            pass
+
+    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+        pass
+    queue._cache = None
+    queue._mtime = 0
+    RESET_FILE.touch()
+
+    await query.message.edit_text(
+        "🗑 تمام موارد در صف پاک شد.",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔙 بازگشت به تنظیمات", callback_data="menu:settings")
+        ]])
+    )
+
 
 def clear_old_status():
     try:
