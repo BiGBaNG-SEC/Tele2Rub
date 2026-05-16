@@ -25,6 +25,7 @@ FAILED_FILE = QUEUE_DIR / "failed.jsonl"
 STATUS_FILE = QUEUE_DIR / "status.jsonl"
 URL_DIR = DOWNLOAD_DIR / "url"
 CANCEL_FILE = QUEUE_DIR / "cancelled.jsonl"
+RESET_FILE = QUEUE_DIR / "reset.flag"
 
 MAX_RETRIES = 5
 UPLOAD_TIMEOUT = 1800
@@ -34,6 +35,15 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 URL_DIR.mkdir(parents=True, exist_ok=True)
 
+# Global cancel event — set this to interrupt the active upload immediately
+_cancel_event = threading.Event()
+
+# Global persistent rubpy client
+_rubika_client: Optional[RubikaClient] = None
+_client_lock = threading.Lock()
+
+
+# ─────────────────────────── helpers ────────────────────────────
 
 def safe_filename(name: Optional[str]) -> str:
     name = (name or "file").strip()
@@ -41,38 +51,36 @@ def safe_filename(name: Optional[str]) -> str:
     name = name.rstrip(". ")
     return name[:200] or "file"
 
+
 def pretty_size(size) -> str:
     size = float(size or 0)
     units = ["B", "KB", "MB", "GB"]
-
     index = 0
     while size >= 1024 and index < len(units) - 1:
         size /= 1024
         index += 1
-
     return f"{size:.2f} {units[index]}"
+
 
 def get_per_attempt_timeout(file_path: str) -> int:
     size_mb = Path(file_path).stat().st_size / (1024 * 1024)
-
     if size_mb < 100:
-        return 180
+        return 300
     elif size_mb < 500:
-        return 420
+        return 600
     elif size_mb < 1000:
-        return 720
+        return 900
     else:
-        return 1200
-    
+        return 1500
+
+
 def eta_text(seconds) -> str:
     if not seconds or seconds <= 0:
         return "نامشخص"
-
     seconds = int(seconds)
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
-
     if h:
         return f"{h}h {m}m"
     if m:
@@ -84,18 +92,22 @@ def push_status(task: dict, text: str, status: str = "working", percent: float |
     payload = {
         "chat_id": task.get("chat_id"),
         "message_id": task.get("status_message_id"),
+        "job_id": task.get("job_id"),
         "status": status,
         "text": text,
         "percent": percent,
         "time": time.time(),
     }
-
     with open(STATUS_FILE, "a", encoding="utf-8") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-def is_cancelled(task: dict) -> bool:
-    job_id = str(task.get("job_id", ""))
 
+def is_cancelled(task: dict) -> bool:
+    """Check both the global cancel event AND the cancel file."""
+    if _cancel_event.is_set():
+        return True
+
+    job_id = str(task.get("job_id", ""))
     if not job_id or not CANCEL_FILE.exists():
         return False
 
@@ -103,26 +115,62 @@ def is_cancelled(task: dict) -> bool:
         for line in file:
             if not line.strip():
                 continue
-
             item = json.loads(line)
             if str(item.get("job_id")) == job_id:
                 return True
-
     return False
+
+
+def should_reset() -> bool:
+    """Returns True if telebot.py requested a full worker reset (e.g. /delall)."""
+    return RESET_FILE.exists()
+
+
+def clear_reset_flag():
+    try:
+        if RESET_FILE.exists():
+            RESET_FILE.unlink()
+    except Exception:
+        pass
+
 
 def unique_path(path: Path) -> Path:
     if not path.exists():
         return path
-
     stem = path.stem
     suffix = path.suffix
     index = 1
-
     while True:
         candidate = path.with_name(f"{stem}_{index}{suffix}")
         if not candidate.exists():
             return candidate
         index += 1
+
+
+# ─────────────────────────── rubika client ────────────────────────────
+
+def get_client() -> RubikaClient:
+    """Return the persistent rubika client, creating/reconnecting if needed."""
+    global _rubika_client
+    with _client_lock:
+        if _rubika_client is None:
+            _rubika_client = RubikaClient(name=SESSION)
+            _rubika_client.start()
+            print("Rubika client connected.")
+        return _rubika_client
+
+
+def reset_client():
+    """Disconnect and destroy the persistent client so it gets recreated fresh."""
+    global _rubika_client
+    with _client_lock:
+        if _rubika_client is not None:
+            try:
+                _rubika_client.disconnect()
+            except Exception:
+                pass
+            _rubika_client = None
+            print("Rubika client reset.")
 
 
 def has_session(session_name: str) -> bool:
@@ -135,11 +183,10 @@ def has_session(session_name: str) -> bool:
 
 
 def ensure_session():
+    """On first run, prompt login if no session file exists."""
     if has_session(SESSION):
         return
-
     client = RubikaClient(name=SESSION)
-
     try:
         client.start()
         print("Login successful.")
@@ -150,43 +197,16 @@ def ensure_session():
             pass
 
 
-def send_document(file_path: str, caption: str = ""):
-    client = RubikaClient(name=SESSION)
+# ─────────────────────────── upload ────────────────────────────
 
+def _upload_in_thread(file_path: str, caption: str, result: dict, error: dict):
+    """Runs in a daemon thread; uploads via the persistent client."""
     try:
-        client.start()
-        return client.send_document(
-            TARGET,
-            file_path,
-            caption=caption or ""
-        )
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+        client = get_client()
+        result["data"] = client.send_document(TARGET, file_path, caption=caption or "")
+    except Exception as e:
+        error["err"] = e
 
-def send_with_timeout(file_path, caption, timeout):
-    result = {}
-    error = {}
-
-    def target():
-        try:
-            result["data"] = send_document(file_path, caption)
-        except Exception as e:
-            error["err"] = e
-
-    t = threading.Thread(target=target)
-    t.start()
-    t.join(timeout)
-
-    if t.is_alive():
-        raise RuntimeError("آپلود بیشتر از حد مجاز طول کشید و لغو شد.")
-
-    if "err" in error:
-        raise error["err"]
-
-    return result.get("data")
 
 def send_with_retry(file_path: str, caption: str = "", task: dict | None = None):
     last_error = None
@@ -194,65 +214,99 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None)
 
     for attempt in range(1, MAX_RETRIES + 1):
 
+        # Hard wall: total time exceeded
         if time.time() - start_time > UPLOAD_TIMEOUT:
             raise RuntimeError("آپلود بیشتر از حد مجاز طول کشید و لغو شد.")
 
+        # Check cancellation before each attempt
         if task and is_cancelled(task):
             raise RuntimeError("ارسال لغو شد.")
 
-        try:
+        if task:
+            push_status(
+                task,
+                f"🔼 در حال آپلود در روبیکا...\n\n"
+                f"تلاش {attempt} از {MAX_RETRIES}\n\n"
+                f"برای لغو ارسال:\n"
+                f"`/del {task.get('job_id')}`",
+                "uploading",
+            )
+
+        elapsed = time.time() - start_time
+        remaining = UPLOAD_TIMEOUT - elapsed
+        per_attempt = min(get_per_attempt_timeout(file_path), remaining)
+
+        result: dict = {}
+        error: dict = {}
+
+        t = threading.Thread(
+            target=_upload_in_thread,
+            args=(file_path, caption, result, error),
+            daemon=True,  # won't block process exit
+        )
+        t.start()
+
+        # Poll every 0.5 s so we can react to cancellation mid-upload
+        deadline = time.time() + per_attempt
+        timed_out = False
+        while t.is_alive():
+            if time.time() > deadline:
+                # Thread is still running past deadline — reset the client
+                # so it doesn't block the next attempt, then bail
+                reset_client()
+                last_error = RuntimeError("آپلود این تلاش از حد زمانی گذشت.")
+                timed_out = True
+                break
+
+            if task and is_cancelled(task):
+                reset_client()
+                raise RuntimeError("ارسال لغو شد.")
+
+            time.sleep(0.5)
+
+        if not timed_out:
+            # Thread finished naturally
+            if "err" in error:
+                last_error = error["err"]
+            else:
+                # Success!
+                return result.get("data")
+
+        # Decide whether to retry
+        error_text = str(last_error).lower() if last_error else ""
+        transient = any(
+            key in error_text
+            for key in [
+                "502", "503", "bad gateway", "timeout",
+                "cannot connect", "connection reset",
+                "temporarily unavailable",
+                "error uploading chunk",
+                "unexpected mimetype",
+                "حد زمانی",
+            ]
+        )
+
+        if transient and attempt < MAX_RETRIES:
+            if task and is_cancelled(task):
+                raise RuntimeError("ارسال لغو شد.")
+
             if task:
                 push_status(
                     task,
-                    f"🔼 در حال آپلود در روبیکا...\n\n"
-                    f"🔴 تلاش {attempt} از {MAX_RETRIES}\n\n"
-                    f"برای لغو ارسال:\n"
-                    f"`/del {task.get('job_id')}`",
-                    "uploading"
+                    f"ارتباط با روبیکا ناپایدار بود...\n"
+                    f"دوباره تلاش می‌کنم ({attempt + 1})",
+                    "uploading",
                 )
+            time.sleep(3)
+            continue
 
-            elapsed = time.time() - start_time
-            remaining = UPLOAD_TIMEOUT - elapsed
-
-            if remaining <= 0:
-                raise RuntimeError("آپلود بیشتر از ۳۰ دقیقه طول کشید و لغو شد.")
-
-            per_attempt = min(get_per_attempt_timeout(file_path), remaining)
-
-            return send_with_timeout(file_path, caption, per_attempt)
-
-        except Exception as e:
-            last_error = e
-            error_text = str(e).lower()
-
-            transient = any(
-                key in error_text
-                for key in [
-                    "502", "503", "bad gateway", "timeout",
-                    "cannot connect", "connection reset",
-                    "temporarily unavailable",
-                    "error uploading chunk",
-                    "unexpected mimetype",
-                ]
-            )
-
-            if transient and attempt < MAX_RETRIES:
-
-                if task and is_cancelled(task):
-                    raise RuntimeError("ارسال لغو شد.")
-
-                if task:
-                    push_status(
-                        task,
-                        f"ارتباط با روبیکا ناپایدار بود...\n"
-                        f"دوباره تلاش می‌کنم ({attempt + 1})",
-                        "uploading"
-                    )
-
-                time.sleep(3)
-                continue
+        # Non-transient error or retries exhausted
+        break
 
     raise last_error if last_error else RuntimeError("Upload failed.")
+
+
+# ─────────────────────────── download url ────────────────────────────
 
 def download_url(task: dict) -> Path:
     url = task.get("url", "").strip()
@@ -271,7 +325,7 @@ def download_url(task: dict) -> Path:
     except requests.exceptions.HTTPError as e:
         code = e.response.status_code if e.response else "نامشخص"
         raise RuntimeError(f"دانلود انجام نشد. کد خطا: {code}")
-    
+
     cd = resp.headers.get("content-disposition", "")
     match = re.findall(r'filename="(.+?)"', cd)
     name = match[0] if match else Path(urlparse(url).path).name
@@ -315,9 +369,11 @@ def download_url(task: dict) -> Path:
     task["file_size"] = target.stat().st_size
     return target
 
+
+# ─────────────────────────── zip ────────────────────────────
+
 def make_zip_with_password(file_path: Path, password: str) -> Path:
     zip_path = unique_path(file_path.with_suffix(file_path.suffix + ".zip"))
-
     with pyzipper.AESZipFile(
         zip_path,
         "w",
@@ -326,25 +382,22 @@ def make_zip_with_password(file_path: Path, password: str) -> Path:
     ) as zip_file:
         zip_file.setpassword(password.encode("utf-8"))
         zip_file.write(file_path, arcname=file_path.name)
-
     return zip_path
+
+
+# ─────────────────────────── queue helpers ────────────────────────────
 
 def pop_first_task():
     if not QUEUE_FILE.exists():
         return None
-
     with open(QUEUE_FILE, "r", encoding="utf-8") as file:
         lines = [line for line in file if line.strip()]
-
     if not lines:
         return None
-
     first_line = lines[0]
     remaining = lines[1:]
-
     with open(QUEUE_FILE, "w", encoding="utf-8") as file:
         file.writelines(remaining)
-
     return json.loads(first_line)
 
 
@@ -363,6 +416,9 @@ def append_failed(task: dict, error: str) -> None:
     with open(FAILED_FILE, "a", encoding="utf-8") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+
+# ─────────────────────────── task processor ────────────────────────────
+
 def process_task(task: dict):
     task_type = task.get("type")
     caption = task.get("caption", "")
@@ -373,7 +429,6 @@ def process_task(task: dict):
 
     if task_type == "local_file":
         local_path = Path(task.get("path", ""))
-
         if not local_path.exists():
             raise RuntimeError("Local file not found.")
 
@@ -385,7 +440,6 @@ def process_task(task: dict):
 
     if safe_mode and zip_password:
         push_status(task, "در حال تبدیل به فایل zip ...", "processing")
-
         try:
             zipped = make_zip_with_password(local_path, zip_password)
         finally:
@@ -394,9 +448,7 @@ def process_task(task: dict):
                     local_path.unlink()
             except Exception:
                 pass
-
         send_path = zipped
-
     else:
         send_path = local_path
 
@@ -406,11 +458,7 @@ def process_task(task: dict):
 
         send_with_retry(str(send_path), caption, task)
 
-        push_status(
-            task,
-            "فایل با موفقیت در روبیکا آپلود شد.",
-            "done"
-        )
+        push_status(task, "✅ فایل با موفقیت در روبیکا آپلود شد.", "done")
 
     finally:
         try:
@@ -419,26 +467,51 @@ def process_task(task: dict):
         except Exception:
             pass
 
+
+# ─────────────────────────── worker loop ────────────────────────────
+
 def worker_loop():
+    global _cancel_event
+
     ensure_session()
+    # Pre-connect the persistent client at startup
+    get_client()
     print("Rubika worker started.")
 
     while True:
+
+        # ── Handle /delall reset flag written by telebot.py ──
+        if should_reset():
+            print("Reset flag detected — clearing state.")
+            _cancel_event.set()   # interrupt any active upload poll loop
+            time.sleep(1)         # give the upload thread a moment to see it
+            _cancel_event.clear()
+            reset_client()        # fresh client for next task
+            clear_reset_flag()
+            clear_processing()
+            continue
+
         task = pop_first_task()
 
         if not task:
             time.sleep(0.2)
             continue
 
+        # Clear any leftover cancel event from a previous cycle
+        _cancel_event.clear()
+
         save_processing(task)
 
         try:
             process_task(task)
         except Exception as e:
-            append_failed(task, str(e))
-            push_status(task, f"خطا: {str(e)}", "failed")
+            err_msg = str(e)
+            if "لغو" not in err_msg:
+                append_failed(task, err_msg)
+            push_status(task, f"❌ {err_msg}", "failed")
         finally:
             clear_processing()
+
 
 if __name__ == "__main__":
     worker_loop()
