@@ -51,7 +51,7 @@
 ابتدا پروژه را دریافت کنید:
 
 ```bash
-git clone https://github.com/caffeinexz/Tele2Rub.git
+https://github.com/BiGBaNG-SEC/Tele2Rub.git
 cd Tele2Rub
 ```
 
