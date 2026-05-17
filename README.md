@@ -51,7 +51,7 @@
 ابتدا پروژه را دریافت کنید:
 
 ```bash
-https://github.com/BiGBaNG-SEC/Tele2Rub.git
+git clone https://github.com/BiGBaNG-SEC/Tele2Rub.git
 cd Tele2Rub
 ```
 
@@ -83,7 +83,7 @@ sudo apt install python3 python3-venv python3-pip git -y
 ### 2. دریافت پروژه
 
 ```bash
-git clone https://github.com/caffeinexz/Tele2Rub.git
+git clone https://github.com/BiGBaNG-SEC/Tele2Rub.git
 cd Tele2Rub
 ```
 
