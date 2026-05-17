@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -10,7 +11,6 @@ from rubpy import Client as RubikaClient
 import requests
 import pyzipper
 from urllib.parse import urlparse
-import threading
 
 load_dotenv()
 
@@ -28,19 +28,12 @@ CANCEL_FILE = QUEUE_DIR / "cancelled.jsonl"
 RESET_FILE = QUEUE_DIR / "reset.flag"
 
 MAX_RETRIES = 5
-UPLOAD_TIMEOUT = 1800
+UPLOAD_TIMEOUT = 1800   # 30 min total wall-clock limit
 TARGET = "me"
 
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 URL_DIR.mkdir(parents=True, exist_ok=True)
-
-# Global cancel event — set this to interrupt the active upload immediately
-_cancel_event = threading.Event()
-
-# Global persistent rubpy client
-_rubika_client: Optional[RubikaClient] = None
-_client_lock = threading.Lock()
 
 
 # ─────────────────────────── helpers ────────────────────────────
@@ -63,6 +56,7 @@ def pretty_size(size) -> str:
 
 
 def get_per_attempt_timeout(file_path: str) -> int:
+    """Seconds to allow for a single upload attempt, based on file size."""
     size_mb = Path(file_path).stat().st_size / (1024 * 1024)
     if size_mb < 100:
         return 300
@@ -98,21 +92,16 @@ def push_status(task: dict, text: str, status: str = "working", percent: float |
         "percent": percent,
         "time": time.time(),
     }
-    with open(STATUS_FILE, "a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    with open(STATUS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def is_cancelled(task: dict) -> bool:
-    """Check both the global cancel event AND the cancel file."""
-    if _cancel_event.is_set():
-        return True
-
     job_id = str(task.get("job_id", ""))
     if not job_id or not CANCEL_FILE.exists():
         return False
-
-    with open(CANCEL_FILE, "r", encoding="utf-8") as file:
-        for line in file:
+    with open(CANCEL_FILE, "r", encoding="utf-8") as f:
+        for line in f:
             if not line.strip():
                 continue
             item = json.loads(line)
@@ -122,7 +111,6 @@ def is_cancelled(task: dict) -> bool:
 
 
 def should_reset() -> bool:
-    """Returns True if telebot.py requested a full worker reset (e.g. /delall)."""
     return RESET_FILE.exists()
 
 
@@ -137,9 +125,7 @@ def clear_reset_flag():
 def unique_path(path: Path) -> Path:
     if not path.exists():
         return path
-    stem = path.stem
-    suffix = path.suffix
-    index = 1
+    stem, suffix, index = path.stem, path.suffix, 1
     while True:
         candidate = path.with_name(f"{stem}_{index}{suffix}")
         if not candidate.exists():
@@ -147,45 +133,20 @@ def unique_path(path: Path) -> Path:
         index += 1
 
 
-# ─────────────────────────── rubika client ────────────────────────────
-
-def get_client() -> RubikaClient:
-    """Return the persistent rubika client, creating/reconnecting if needed."""
-    global _rubika_client
-    with _client_lock:
-        if _rubika_client is None:
-            _rubika_client = RubikaClient(name=SESSION)
-            _rubika_client.start()
-            print("Rubika client connected.")
-        return _rubika_client
-
-
-def reset_client():
-    """Disconnect and destroy the persistent client so it gets recreated fresh."""
-    global _rubika_client
-    with _client_lock:
-        if _rubika_client is not None:
-            try:
-                _rubika_client.disconnect()
-            except Exception:
-                pass
-            _rubika_client = None
-            print("Rubika client reset.")
-
-
 def has_session(session_name: str) -> bool:
-    candidates = [
-        Path(session_name),
-        Path(f"{session_name}.session"),
-        Path(f"{session_name}.sqlite"),
-    ]
-    return any(path.exists() for path in candidates)
+    return any(
+        Path(p).exists()
+        for p in [session_name, f"{session_name}.session", f"{session_name}.sqlite"]
+    )
 
+
+# ─────────────────────────── first-run login (sync) ────────────────────────────
 
 def ensure_session():
-    """On first run, prompt login if no session file exists."""
+    """Interactive login before asyncio starts — only runs once."""
     if has_session(SESSION):
         return
+    print("No session found. Starting login...")
     client = RubikaClient(name=SESSION)
     try:
         client.start()
@@ -199,26 +160,33 @@ def ensure_session():
 
 # ─────────────────────────── upload ────────────────────────────
 
-def _upload_in_thread(file_path: str, caption: str, result: dict, error: dict):
-    """Runs in a daemon thread; uploads via the persistent client."""
-    try:
-        client = get_client()
-        result["data"] = client.send_document(TARGET, file_path, caption=caption or "")
-    except Exception as e:
-        error["err"] = e
+async def upload_once(file_path: str, caption: str, timeout_s: int):
+    """
+    Create a brand-new RubikaClient for each upload attempt.
+
+    Why: rubpy creates an aiohttp.ClientSession in __init__ (synchronous),
+    so the session is bound to whatever event loop is running at construction
+    time. Reusing a client across attempts risks 'Session is closed' errors.
+    A fresh client per attempt is the safest pattern.
+
+    The client's own timeout is set to timeout_s so aiohttp's internal
+    asyncio.timeout() fires inside a proper Task context.
+    """
+    async with RubikaClient(name=SESSION, timeout=timeout_s) as client:
+        await client.send_document(TARGET, file_path, caption=caption or "")
 
 
-def send_with_retry(file_path: str, caption: str = "", task: dict | None = None):
+async def send_with_retry(file_path: str, caption: str = "", task: dict | None = None):
     last_error = None
     start_time = time.time()
 
     for attempt in range(1, MAX_RETRIES + 1):
 
-        # Hard wall: total time exceeded
-        if time.time() - start_time > UPLOAD_TIMEOUT:
+        # Total wall-clock guard
+        elapsed = time.time() - start_time
+        if elapsed > UPLOAD_TIMEOUT:
             raise RuntimeError("آپلود بیشتر از حد مجاز طول کشید و لغو شد.")
 
-        # Check cancellation before each attempt
         if task and is_cancelled(task):
             raise RuntimeError("ارسال لغو شد.")
 
@@ -227,80 +195,47 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None)
                 task,
                 f"🔼 در حال آپلود در روبیکا...\n\n"
                 f"تلاش {attempt} از {MAX_RETRIES}\n\n"
-                f"برای لغو ارسال:\n"
+                f"برای لغو:\n"
                 f"`/del {task.get('job_id')}`",
                 "uploading",
             )
 
-        elapsed = time.time() - start_time
-        remaining = UPLOAD_TIMEOUT - elapsed
-        per_attempt = min(get_per_attempt_timeout(file_path), remaining)
+        remaining = UPLOAD_TIMEOUT - (time.time() - start_time)
+        per_attempt = min(get_per_attempt_timeout(file_path), int(remaining))
 
-        result: dict = {}
-        error: dict = {}
+        try:
+            await upload_once(file_path, caption, per_attempt)
+            return  # ✅ success
 
-        t = threading.Thread(
-            target=_upload_in_thread,
-            args=(file_path, caption, result, error),
-            daemon=True,  # won't block process exit
-        )
-        t.start()
+        except asyncio.CancelledError:
+            raise RuntimeError("ارسال لغو شد.")
 
-        # Poll every 0.5 s so we can react to cancellation mid-upload
-        deadline = time.time() + per_attempt
-        timed_out = False
-        while t.is_alive():
-            if time.time() > deadline:
-                # Thread is still running past deadline — reset the client
-                # so it doesn't block the next attempt, then bail
-                reset_client()
-                last_error = RuntimeError("آپلود این تلاش از حد زمانی گذشت.")
-                timed_out = True
-                break
-
-            if task and is_cancelled(task):
-                reset_client()
-                raise RuntimeError("ارسال لغو شد.")
-
-            time.sleep(0.5)
-
-        if not timed_out:
-            # Thread finished naturally
-            if "err" in error:
-                last_error = error["err"]
-            else:
-                # Success!
-                return result.get("data")
+        except Exception as e:
+            last_error = e
+            print(f"Upload attempt {attempt} failed: {e}")
 
         # Decide whether to retry
-        error_text = str(last_error).lower() if last_error else ""
-        transient = any(
-            key in error_text
-            for key in [
-                "502", "503", "bad gateway", "timeout",
-                "cannot connect", "connection reset",
-                "temporarily unavailable",
-                "error uploading chunk",
-                "unexpected mimetype",
-                "حد زمانی",
-            ]
-        )
+        err_lower = str(last_error).lower()
+        transient = any(k in err_lower for k in [
+            "502", "503", "bad gateway", "timeout", "timed out",
+            "cannot connect", "connection reset", "temporarily unavailable",
+            "error uploading chunk", "unexpected mimetype",
+        ])
 
         if transient and attempt < MAX_RETRIES:
             if task and is_cancelled(task):
                 raise RuntimeError("ارسال لغو شد.")
-
             if task:
                 push_status(
                     task,
                     f"ارتباط با روبیکا ناپایدار بود...\n"
-                    f"دوباره تلاش می‌کنم ({attempt + 1})",
+                    f"دوباره تلاش می‌کنم ({attempt + 1} از {MAX_RETRIES})",
                     "uploading",
                 )
-            time.sleep(3)
+            await asyncio.sleep(5)
             continue
 
-        # Non-transient error or retries exhausted
+        # Non-transient error — stop retrying
         break
 
     raise last_error if last_error else RuntimeError("Upload failed.")
@@ -308,63 +243,68 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None)
 
 # ─────────────────────────── download url ────────────────────────────
 
-def download_url(task: dict) -> Path:
+async def download_url(task: dict) -> Path:
     url = task.get("url", "").strip()
     if not url:
         raise RuntimeError("URL خالیه")
 
     push_status(task, "در حال دانلود ...", "downloading", 0)
+    loop = asyncio.get_event_loop()
 
-    try:
-        resp = requests.get(url, stream=True, timeout=(10, 60), allow_redirects=True)
-        resp.raise_for_status()
-    except requests.exceptions.Timeout:
-        raise RuntimeError("لینک جواب نداد")
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError("مشکل شبکه")
-    except requests.exceptions.HTTPError as e:
-        code = e.response.status_code if e.response else "نامشخص"
-        raise RuntimeError(f"دانلود انجام نشد. کد خطا: {code}")
+    def _do_download():
+        try:
+            resp = requests.get(url, stream=True, timeout=(10, 60), allow_redirects=True)
+            resp.raise_for_status()
+        except requests.exceptions.Timeout:
+            raise RuntimeError("لینک جواب نداد")
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("مشکل شبکه")
+        except requests.exceptions.HTTPError as e:
+            code = e.response.status_code if e.response else "نامشخص"
+            raise RuntimeError(f"دانلود انجام نشد. کد خطا: {code}")
 
-    cd = resp.headers.get("content-disposition", "")
-    match = re.findall(r'filename="(.+?)"', cd)
-    name = match[0] if match else Path(urlparse(url).path).name
-    name = safe_filename(name or f"file_{int(time.time())}")
-    if "." not in name:
-        name += ".bin"
+        cd = resp.headers.get("content-disposition", "")
+        match = re.findall(r'filename="(.+?)"', cd)
+        name = match[0] if match else Path(urlparse(url).path).name
+        name = safe_filename(name or f"file_{int(time.time())}")
+        if "." not in name:
+            name += ".bin"
 
-    target = unique_path(URL_DIR / name)
-    total = int(resp.headers.get("content-length") or 0)
-    downloaded, last_update, started = 0, 0, time.time()
+        target = unique_path(URL_DIR / name)
+        total = int(resp.headers.get("content-length") or 0)
+        downloaded_bytes, last_update, started = 0, 0, time.time()
 
-    with open(target, "wb") as f:
-        for chunk in resp.iter_content(1024 * 1024):
-            if not chunk:
-                continue
-            f.write(chunk)
-            downloaded += len(chunk)
+        with open(target, "wb") as f:
+            for chunk in resp.iter_content(1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded_bytes += len(chunk)
 
-            now = time.time()
-            if now - last_update < 3 and downloaded < total:
-                continue
-            last_update = now
+                now = time.time()
+                if now - last_update < 3 and downloaded_bytes < total:
+                    continue
+                last_update = now
 
-            speed = downloaded / max(now - started, 1)
-            eta = (total - downloaded) / speed if total and speed else None
-            percent = downloaded * 100 / total if total else None
+                speed = downloaded_bytes / max(now - started, 1)
+                eta = (total - downloaded_bytes) / speed if total and speed else None
+                percent = downloaded_bytes * 100 / total if total else None
 
-            text = f"داره دانلود میکنه...\n\n{pretty_size(downloaded)}"
-            if total:
-                text += f" از {pretty_size(total)}"
-            text += f"\nسرعت: {pretty_size(speed)}/s"
-            if eta:
-                text += f"\nمونده: {eta_text(eta)}"
+                text = f"داره دانلود میکنه...\n\n{pretty_size(downloaded_bytes)}"
+                if total:
+                    text += f" از {pretty_size(total)}"
+                text += f"\nسرعت: {pretty_size(speed)}/s"
+                if eta:
+                    text += f"\nمونده: {eta_text(eta)}"
 
-            push_status(task, text, "downloading", percent)
+                push_status(task, text, "downloading", percent)
 
-    if not target.exists() or target.stat().st_size == 0:
-        raise RuntimeError("فایل دانلود نشد")
+        if not target.exists() or target.stat().st_size == 0:
+            raise RuntimeError("فایل دانلود نشد")
 
+        return target
+
+    target = await loop.run_in_executor(None, _do_download)
     task["file_name"] = target.name
     task["file_size"] = target.stat().st_size
     return target
@@ -372,38 +312,39 @@ def download_url(task: dict) -> Path:
 
 # ─────────────────────────── zip ────────────────────────────
 
-def make_zip_with_password(file_path: Path, password: str) -> Path:
-    zip_path = unique_path(file_path.with_suffix(file_path.suffix + ".zip"))
-    with pyzipper.AESZipFile(
-        zip_path,
-        "w",
-        compression=pyzipper.ZIP_STORED,
-        encryption=pyzipper.WZ_AES,
-    ) as zip_file:
-        zip_file.setpassword(password.encode("utf-8"))
-        zip_file.write(file_path, arcname=file_path.name)
-    return zip_path
+async def make_zip_with_password(file_path: Path, password: str) -> Path:
+    loop = asyncio.get_event_loop()
+
+    def _zip():
+        zip_path = unique_path(file_path.with_suffix(file_path.suffix + ".zip"))
+        with pyzipper.AESZipFile(zip_path, "w",
+                                  compression=pyzipper.ZIP_STORED,
+                                  encryption=pyzipper.WZ_AES) as zf:
+            zf.setpassword(password.encode("utf-8"))
+            zf.write(file_path, arcname=file_path.name)
+        return zip_path
+
+    return await loop.run_in_executor(None, _zip)
 
 
 # ─────────────────────────── queue helpers ────────────────────────────
 
-def pop_first_task():
+def pop_first_task() -> dict | None:
     if not QUEUE_FILE.exists():
         return None
-    with open(QUEUE_FILE, "r", encoding="utf-8") as file:
-        lines = [line for line in file if line.strip()]
+    with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+        lines = [l for l in f if l.strip()]
     if not lines:
         return None
-    first_line = lines[0]
-    remaining = lines[1:]
-    with open(QUEUE_FILE, "w", encoding="utf-8") as file:
-        file.writelines(remaining)
-    return json.loads(first_line)
+    task = json.loads(lines[0])
+    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+        f.writelines(lines[1:])
+    return task
 
 
 def save_processing(task: dict) -> None:
-    with open(PROCESSING_FILE, "w", encoding="utf-8") as file:
-        json.dump(task, file, ensure_ascii=False, indent=2)
+    with open(PROCESSING_FILE, "w", encoding="utf-8") as f:
+        json.dump(task, f, ensure_ascii=False, indent=2)
 
 
 def clear_processing() -> None:
@@ -412,98 +353,78 @@ def clear_processing() -> None:
 
 
 def append_failed(task: dict, error: str) -> None:
-    payload = {"task": task, "error": error}
-    with open(FAILED_FILE, "a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    with open(FAILED_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"task": task, "error": error}, ensure_ascii=False) + "\n")
 
 
 # ─────────────────────────── task processor ────────────────────────────
 
-def process_task(task: dict):
+async def process_task(task: dict):
     task_type = task.get("type")
     caption = task.get("caption", "")
     safe_mode = task.get("safe_mode", False)
     zip_password = task.get("zip_password", "")
 
-    local_path: Path | None = None
-
     if task_type == "local_file":
         local_path = Path(task.get("path", ""))
         if not local_path.exists():
-            raise RuntimeError("Local file not found.")
+            raise RuntimeError(f"فایل پیدا نشد: {local_path.name}")
 
     elif task_type == "direct_url":
-        local_path = download_url(task)
+        local_path = await download_url(task)
 
     else:
         raise RuntimeError("Unknown task type.")
 
+    send_path = local_path
+
     if safe_mode and zip_password:
-        push_status(task, "در حال تبدیل به فایل zip ...", "processing")
+        push_status(task, "در حال تبدیل به فایل ZIP ...", "processing")
         try:
-            zipped = make_zip_with_password(local_path, zip_password)
+            send_path = await make_zip_with_password(local_path, zip_password)
         finally:
             try:
-                if local_path.exists():
-                    local_path.unlink()
+                local_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        send_path = zipped
-    else:
-        send_path = local_path
 
     try:
         if is_cancelled(task):
             raise RuntimeError("ارسال لغو شد.")
 
-        send_with_retry(str(send_path), caption, task)
-
+        await send_with_retry(str(send_path), caption, task)
         push_status(task, "✅ فایل با موفقیت در روبیکا آپلود شد.", "done")
 
     finally:
         try:
-            if send_path and send_path.exists():
-                send_path.unlink()
+            send_path.unlink(missing_ok=True)
         except Exception:
             pass
 
 
 # ─────────────────────────── worker loop ────────────────────────────
 
-def worker_loop():
-    global _cancel_event
-
-    ensure_session()
-    # Pre-connect the persistent client at startup
-    get_client()
+async def worker_loop():
     print("Rubika worker started.")
 
     while True:
-
-        # ── Handle /delall reset flag written by telebot.py ──
         if should_reset():
             print("Reset flag detected — clearing state.")
-            _cancel_event.set()   # interrupt any active upload poll loop
-            time.sleep(1)         # give the upload thread a moment to see it
-            _cancel_event.clear()
-            reset_client()        # fresh client for next task
             clear_reset_flag()
             clear_processing()
+            await asyncio.sleep(0.5)
             continue
 
         task = pop_first_task()
 
         if not task:
-            time.sleep(0.2)
+            await asyncio.sleep(0.2)
             continue
-
-        # Clear any leftover cancel event from a previous cycle
-        _cancel_event.clear()
 
         save_processing(task)
 
         try:
-            process_task(task)
+            await process_task(task)
         except Exception as e:
             err_msg = str(e)
             if "لغو" not in err_msg:
@@ -513,5 +434,13 @@ def worker_loop():
             clear_processing()
 
 
+# ─────────────────────────── entry point ────────────────────────────
+
+async def main():
+    # Create a proper Task so rubpy's internal asyncio.timeout() works correctly
+    await asyncio.create_task(worker_loop())
+
+
 if __name__ == "__main__":
-    worker_loop()
+    ensure_session()
+    asyncio.run(main())
